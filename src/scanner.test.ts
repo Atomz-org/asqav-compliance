@@ -1,5 +1,8 @@
 import * as assert from 'assert';
-import { analyzeFile, generateReport } from './scanner';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { analyzeFile, generateReport, globToRegExp, loadConfig, parseConfig, scanDirectory, EMPTY_CONFIG } from './scanner';
 
 let passed: number = 0;
 let failed: number = 0;
@@ -257,6 +260,86 @@ test('score is partial when some checks pass', () => {
   const results = [analyzeFile('partial.py', content)];
   const report: string = generateReport(results);
   assert.ok(report.includes('40/100'), 'Score should be 40/100 (audit + policy = 40)');
+});
+
+// === repository config (.asqav.json) ===
+
+const TRACED: string = `from anthropic import Anthropic\nfrom pf import trace\n\ndef call():\n    tr = trace.get()\n    tr.intent('x')\n`;
+
+test('without a config the built-in vocabulary decides', () => {
+  assert.ok(!analyzeFile('agent.py', TRACED).auditTrail.pass, 'pf.trace is not a built-in audit pattern');
+});
+
+test('a repo pattern teaches the scanner how the codebase spells a control', () => {
+  const config = parseConfig({ version: 1, patterns: { auditTrail: ['\\btrace\\.get\\(\\)'] } }, '.asqav.json');
+  const result = analyzeFile('agent.py', TRACED, config);
+  assert.ok(result.auditTrail.pass, 'the declared pattern satisfies the audit trail');
+  assert.ok(result.auditTrail.matches.includes('trace.get()'), 'the match is reported');
+});
+
+test('repo patterns only add: built-in patterns still apply and nothing is switched off', () => {
+  const config = parseConfig({ patterns: { auditTrail: ['never_matches_anything_zz'] } }, '.asqav.json');
+  const content: string = `import openai\nimport logging\nlogger = logging.getLogger(__name__)\n`;
+  assert.ok(analyzeFile('a.py', content, config).auditTrail.pass, 'logging still counts');
+});
+
+test('error handling accepts a repo pattern as an alternative to try/except', () => {
+  const config = parseConfig({ patterns: { errorHandling: ['NoCredentials'] } }, '.asqav.json');
+  const content: string = `import anthropic\nraise NoCredentials('no key')\n`;
+  assert.ok(analyzeFile('b.py', content, config).errorHandling.pass);
+  assert.ok(!analyzeFile('b.py', content).errorHandling.pass);
+});
+
+test('a broken config never breaks the scan: every problem is a warning', () => {
+  const c = parseConfig({ exclude: 'tests', patterns: { auditTrail: ['(unclosed'], nonsense: ['x'], humanOversight: 'x' } }, '.asqav.json');
+  assert.strictEqual(c.exclude.length, 0);
+  assert.ok(!c.patterns.auditTrail, 'an invalid regex is skipped');
+  assert.strictEqual(c.warnings.length, 4, c.warnings.join(' | '));
+  const v = parseConfig({ version: 2 }, '.asqav.json');
+  assert.ok(v.warnings[0].includes('unsupported version') && !v.source, 'an unknown version falls back to defaults');
+  assert.ok(parseConfig([1, 2], 'x').warnings.length === 1);
+});
+
+test('globs: ** crosses directories, * does not', () => {
+  assert.ok(globToRegExp('**/tests/**').test('platform/tests/gate/test_loops.py'));
+  assert.ok(globToRegExp('**/tests/**').test('tests/a.py'));
+  assert.ok(globToRegExp('**/test_*.py').test('pkg/test_x.py'));
+  assert.ok(!globToRegExp('src/*.py').test('src/a/b.py'));
+  assert.ok(globToRegExp('src/*.py').test('src/a.py'));
+  assert.ok(globToRegExp('docs/v1.0/**').test('docs/v1.0/x.py') && !globToRegExp('docs/v1.0/**').test('docs/v100/x.py'), 'dots are literal');
+});
+
+test('excluded paths are not scanned; the rest are, from the repository root', () => {
+  const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'asqav-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'platform', 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'agent.py'), 'import anthropic\n');
+  fs.writeFileSync(path.join(root, 'platform', 'tests', 'test_agent.py'), 'import anthropic\n');
+  fs.writeFileSync(path.join(root, '.asqav.json'), JSON.stringify({ version: 1, exclude: ['**/tests/**'] }));
+  const config = loadConfig(root);
+  assert.strictEqual(config.source, '.asqav.json');
+  const all = scanDirectory(root).map((f) => path.relative(root, f.filePath)).sort();
+  const scoped = scanDirectory(root, config, root).map((f) => path.relative(root, f.filePath)).sort();
+  assert.deepStrictEqual(all, [path.join('platform', 'tests', 'test_agent.py'), path.join('src', 'agent.py')]);
+  assert.deepStrictEqual(scoped, [path.join('src', 'agent.py')]);
+});
+
+test('no config file is not an error; an explicit missing one is a warning; bad JSON falls back', () => {
+  const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'asqav-'));
+  assert.strictEqual(loadConfig(root), EMPTY_CONFIG);
+  assert.ok(loadConfig(root, 'governance/asqav.json').warnings[0].includes('not found'));
+  fs.writeFileSync(path.join(root, '.asqav.json'), '{ not json');
+  const bad = loadConfig(root);
+  assert.ok(!bad.source && bad.warnings[0].includes('not valid JSON'));
+});
+
+test('the report says when a repository config extended the vocabulary', () => {
+  const config = parseConfig({ patterns: { auditTrail: ['trace\\.get'] }, exclude: ['**/tests/**'] }, '.asqav.json');
+  const report: string = generateReport([analyzeFile('agent.py', TRACED, config)], config);
+  assert.ok(report.includes('Repository config `.asqav.json`'), 'config named');
+  assert.ok(report.includes('Audit Trail +1') && report.includes('`**/tests/**`'), 'what it added');
+  assert.ok(report.includes('Built-in patterns still apply'));
+  assert.ok(!generateReport([analyzeFile('agent.py', TRACED)]).includes('Repository config'), 'silent without one');
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);

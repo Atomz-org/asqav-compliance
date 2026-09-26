@@ -13,6 +13,10 @@ inputs:
     description: 'Path to scan (default: entire repo)'
     required: false
     default: '.'
+  config:
+    description: 'Repository config (JSON) with extra patterns per category and excluded paths; default .asqav.json at the workspace root when present'
+    required: false
+    default: ''
   fail-on-gaps:
     description: 'Fail the check if governance gaps are found'
     required: false
