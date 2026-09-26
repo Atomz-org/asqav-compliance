@@ -333,6 +333,27 @@ test('no config file is not an error; an explicit missing one is a warning; bad 
   assert.ok(!bad.source && bad.warnings[0].includes('not valid JSON'));
 });
 
+test('loadConfig refuses a config that resolves outside the workspace', () => {
+  const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'asqav-root-'));
+  const outside: string = fs.mkdtempSync(path.join(os.tmpdir(), 'asqav-out-'));
+  fs.writeFileSync(path.join(outside, 'evil.json'), JSON.stringify({ version: 1, exclude: ['**'] }));
+  for (const explicit of [path.join(outside, 'evil.json'), path.relative(root, path.join(outside, 'evil.json'))]) {
+    const c = loadConfig(root, explicit);
+    assert.deepStrictEqual(c.exclude, []);
+    assert.ok(c.warnings[0].includes('outside the workspace'), c.warnings[0]);
+  }
+  fs.symlinkSync(path.join(outside, 'evil.json'), path.join(root, '.asqav.json'));
+  const linked = loadConfig(root);
+  assert.deepStrictEqual(linked.exclude, []);
+  assert.ok(linked.warnings[0].includes('outside the workspace'));
+  fs.unlinkSync(path.join(root, '.asqav.json'));
+  fs.mkdirSync(path.join(root, 'cfg'));
+  fs.writeFileSync(path.join(root, 'cfg', 'real.json'), JSON.stringify({ version: 1, exclude: ['tests/**'] }));
+  fs.symlinkSync(path.join(root, 'cfg', 'real.json'), path.join(root, '.asqav.json'));
+  assert.deepStrictEqual(loadConfig(root).exclude, ['tests/**']);
+  assert.strictEqual(loadConfig(root).source, '.asqav.json');
+});
+
 test('the report says when a repository config extended the vocabulary', () => {
   const config = parseConfig({ patterns: { auditTrail: ['trace\\.get'] }, exclude: ['**/tests/**'] }, '.asqav.json');
   const report: string = generateReport([analyzeFile('agent.py', TRACED, config)], config);

@@ -32789,15 +32789,29 @@ function parseConfig(raw, source) {
     }
     return config;
 }
-/** The repository config at `explicit` (relative to root) or `<root>/.asqav.json`; none is not an error. */
+/** The repository config at `explicit` (relative to root) or `<root>/.asqav.json`; none is not an error.
+ *  Both paths are resolved through symlinks, and a config that lands outside the workspace is refused. */
 function loadConfig(root, explicit = '') {
     const file = path.resolve(root, explicit || exports.CONFIG_FILE);
     if (!fs.existsSync(file)) {
         return explicit ? { ...exports.EMPTY_CONFIG, warnings: [`config ${explicit} not found; scanning with defaults`] } : exports.EMPTY_CONFIG;
     }
     const source = path.relative(root, file) || exports.CONFIG_FILE;
+    let real;
     try {
-        return parseConfig(JSON.parse(fs.readFileSync(file, 'utf-8')), source);
+        const realRoot = fs.realpathSync(root);
+        real = fs.realpathSync(file);
+        const inside = path.relative(realRoot, real);
+        if (!inside || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+            return { ...exports.EMPTY_CONFIG, warnings: [`${source}: resolves outside the workspace; scanning with defaults`] };
+        }
+    }
+    catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return { ...exports.EMPTY_CONFIG, warnings: [`${source}: cannot be resolved (${message}); scanning with defaults`] };
+    }
+    try {
+        return parseConfig(JSON.parse(fs.readFileSync(real, 'utf-8')), source);
     }
     catch (e) {
         const message = e instanceof Error ? e.message : String(e);
