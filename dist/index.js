@@ -7666,7 +7666,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -7677,7 +7683,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -8714,7 +8725,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -9055,6 +9065,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -9102,6 +9113,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -9324,27 +9338,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -9371,6 +9427,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -9474,6 +9535,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -9650,6 +9716,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -9708,6 +9775,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -9718,8 +9788,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -9738,8 +9811,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -9749,10 +9824,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -9815,7 +9891,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -9853,6 +9929,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -9865,6 +9966,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -9922,8 +10049,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -9960,6 +10095,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -11832,6 +11968,7 @@ class DispatcherBase extends Dispatcher {
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
     }
   }
@@ -13408,6 +13545,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -13622,6 +13781,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -13643,6 +13808,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -17768,32 +17939,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -17923,7 +18087,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -17932,16 +18096,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -18084,7 +18312,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -30619,6 +30853,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(6897)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -30639,18 +30878,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -30674,9 +30917,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -30841,10 +31084,12 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -30863,14 +31108,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -30940,8 +31188,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -31994,9 +32251,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -32204,6 +32464,15 @@ async function run() {
         const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
         const fullScanPath = path.resolve(workspace, scanPath);
         core.info(`Scanning for AI agent governance gaps in: ${fullScanPath}`);
+        // The repository's own vocabulary (`.asqav.json` or the `config` input):
+        // extra patterns per category and excluded paths. Additive only; a missing
+        // or broken config scans with the defaults and says why.
+        const config = (0, scanner_1.loadConfig)(workspace, core.getInput('config') || '');
+        for (const w of config.warnings)
+            core.warning(w);
+        if (config.source) {
+            core.info(`Repository config ${config.source}: ${(0, scanner_1.extraPatternCount)(config)} extra pattern(s), ${config.exclude.length} exclusion(s)`);
+        }
         // Anonymous health ping; never blocks the action even if the network is down.
         try {
             const https = __nccwpck_require__(5692);
@@ -32218,13 +32487,13 @@ async function run() {
             req.end();
         }
         catch (e) { }
-        const agentFiles = (0, scanner_1.scanDirectory)(fullScanPath);
+        const agentFiles = (0, scanner_1.scanDirectory)(fullScanPath, config, workspace);
         core.info(`Found ${agentFiles.length} Python file(s) using AI agent frameworks`);
         const results = agentFiles.map(({ filePath, content }) => {
             const relativePath = path.relative(workspace, filePath);
-            return (0, scanner_1.analyzeFile)(relativePath, content);
+            return (0, scanner_1.analyzeFile)(relativePath, content, config);
         });
-        const report = (0, scanner_1.generateReport)(results);
+        const report = (0, scanner_1.generateReport)(results, config);
         core.info('Compliance report generated');
         const context = github.context;
         if (context.payload.pull_request) {
@@ -32335,12 +32604,227 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MAX_PATTERN_LENGTH = exports.CONFIG_FILE = exports.EMPTY_CONFIG = void 0;
+exports.globToRegExp = globToRegExp;
+exports.unsafePattern = unsafePattern;
+exports.parseConfig = parseConfig;
+exports.loadConfig = loadConfig;
+exports.isExcluded = isExcluded;
+exports.extraPatternCount = extraPatternCount;
 exports.scanDirectory = scanDirectory;
 exports.analyzeFile = analyzeFile;
 exports.computeScore = computeScore;
 exports.generateReport = generateReport;
 const fs = __importStar(__nccwpck_require__(9896));
 const path = __importStar(__nccwpck_require__(6928));
+const CATEGORY_KEYS = ['auditTrail', 'policyEnforcement', 'revocation', 'humanOversight', 'errorHandling'];
+exports.EMPTY_CONFIG = { source: null, exclude: [], excludeRes: [], patterns: {}, warnings: [] };
+exports.CONFIG_FILE = '.asqav.json';
+/** A path glob as a regex over `/`-separated relative paths: `**` crosses directories, `*` and `?` do not. */
+function globToRegExp(glob) {
+    let out = '';
+    for (let i = 0; i < glob.length; i++) {
+        const c = glob[i];
+        if (c === '*' && glob[i + 1] === '*') {
+            i++;
+            if (glob[i + 1] === '/') {
+                i++;
+                out += '(?:.*/)?';
+            }
+            else {
+                out += '.*';
+            }
+        }
+        else if (c === '*') {
+            out += '[^/]*';
+        }
+        else if (c === '?') {
+            out += '[^/]';
+        }
+        else {
+            out += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+        }
+    }
+    return new RegExp(`^${out}$`);
+}
+/** Longest repository pattern accepted; longer ones are refused, not truncated. */
+exports.MAX_PATTERN_LENGTH = 200;
+/**
+ * Why a repository pattern could make matching unbounded, or null when it is
+ * safe to run. JavaScript regexes have no timeout, and a config pattern runs
+ * synchronously over every scanned file (up to 1 MiB), so a shape that
+ * backtracks catastrophically would stall the scan. Refused before compiling:
+ * backreferences, and a repeated group (`*`, `+`, `{n,}`, `{n,m}` with m > 1)
+ * that itself contains a repeat — `(a+)+`, `(\\w*)*` — or an alternation —
+ * `(a|aa)+`. Deliberately conservative: a refused pattern is a warning and the
+ * built-in patterns still apply.
+ */
+function unsafePattern(pattern) {
+    if (pattern.length > exports.MAX_PATTERN_LENGTH)
+        return `longer than ${exports.MAX_PATTERN_LENGTH} characters`;
+    if (/\\[1-9]|\\k</.test(pattern))
+        return 'uses a backreference';
+    const stack = [{ repeats: false, alternates: false }];
+    // A quantifier at i that repeats (more than once); returns its length, or 0.
+    const repeatAt = (i) => {
+        const c = pattern[i];
+        if (c === '*' || c === '+')
+            return 1;
+        if (c === '{') {
+            const m = pattern.slice(i).match(/^\{(\d+)(,(\d*))?\}/);
+            if (m && (m[2] !== undefined && (m[3] === '' || Number(m[3]) > 1)))
+                return m[0].length;
+            if (m && Number(m[1]) > 1 && m[2] === undefined)
+                return m[0].length;
+        }
+        return 0;
+    };
+    for (let i = 0; i < pattern.length; i++) {
+        const c = pattern[i];
+        const top = stack[stack.length - 1];
+        if (c === '\\') {
+            i++;
+            if (repeatAt(i + 1))
+                top.repeats = true;
+            continue;
+        }
+        if (c === '[') {
+            let j = i + 1;
+            while (j < pattern.length && pattern[j] !== ']')
+                j += pattern[j] === '\\' ? 2 : 1;
+            i = j;
+            if (repeatAt(i + 1))
+                top.repeats = true;
+            continue;
+        }
+        if (c === '(') {
+            stack.push({ repeats: false, alternates: false });
+            continue;
+        }
+        if (c === '|') {
+            top.alternates = true;
+            continue;
+        }
+        if (c === ')') {
+            const inner = stack.length > 1 ? stack.pop() : top;
+            const parent = stack[stack.length - 1];
+            if (repeatAt(i + 1)) {
+                if (inner.repeats)
+                    return 'repeats a group that already repeats (nested quantifier)';
+                if (inner.alternates)
+                    return 'repeats a group with alternatives';
+                parent.repeats = true;
+            }
+            parent.repeats = parent.repeats || inner.repeats;
+            continue;
+        }
+        if (repeatAt(i + 1) && c !== '?' && c !== '*' && c !== '+' && c !== '}')
+            top.repeats = true;
+    }
+    return null;
+}
+/** Parse a config object; problems become warnings and the scan falls back to defaults. */
+function parseConfig(raw, source) {
+    const config = { source, exclude: [], excludeRes: [], patterns: {}, warnings: [] };
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+        config.warnings.push(`${source}: expected a JSON object; ignored`);
+        return { ...exports.EMPTY_CONFIG, warnings: config.warnings };
+    }
+    const obj = raw;
+    if (obj.version !== undefined && obj.version !== 1) {
+        config.warnings.push(`${source}: unsupported version ${String(obj.version)}; ignored`);
+        return { ...exports.EMPTY_CONFIG, warnings: config.warnings };
+    }
+    if (obj.exclude !== undefined) {
+        if (!Array.isArray(obj.exclude)) {
+            config.warnings.push(`${source}: "exclude" must be a list of globs; ignored`);
+        }
+        else {
+            for (const g of obj.exclude) {
+                if (typeof g === 'string' && g.trim()) {
+                    config.exclude.push(g.trim());
+                    config.excludeRes.push(globToRegExp(g.trim().replace(/^\.\//, '')));
+                }
+                else {
+                    config.warnings.push(`${source}: exclude entry ${JSON.stringify(g)} is not a glob; skipped`);
+                }
+            }
+        }
+    }
+    const patterns = obj.patterns;
+    if (patterns !== undefined) {
+        if (typeof patterns !== 'object' || patterns === null || Array.isArray(patterns)) {
+            config.warnings.push(`${source}: "patterns" must map a category to a list of regexes; ignored`);
+        }
+        else {
+            for (const [key, list] of Object.entries(patterns)) {
+                if (!CATEGORY_KEYS.includes(key)) {
+                    config.warnings.push(`${source}: unknown category "${key}" (expected one of ${CATEGORY_KEYS.join(', ')}); skipped`);
+                    continue;
+                }
+                if (!Array.isArray(list)) {
+                    config.warnings.push(`${source}: patterns.${key} must be a list; skipped`);
+                    continue;
+                }
+                const compiled = [];
+                for (const p of list) {
+                    try {
+                        if (typeof p !== 'string' || !p)
+                            throw new Error('not a string');
+                        const unsafe = unsafePattern(p);
+                        if (unsafe) {
+                            config.warnings.push(`${source}: patterns.${key} entry ${JSON.stringify(p)} ${unsafe}, which can stall a scan; skipped`);
+                            continue;
+                        }
+                        compiled.push(new RegExp(p));
+                    }
+                    catch (e) {
+                        config.warnings.push(`${source}: patterns.${key} entry ${JSON.stringify(p)} is not a valid regex; skipped`);
+                    }
+                }
+                if (compiled.length)
+                    config.patterns[key] = compiled;
+            }
+        }
+    }
+    return config;
+}
+/** The repository config at `explicit` (relative to root) or `<root>/.asqav.json`; none is not an error.
+ *  Both paths are resolved through symlinks, and a config that lands outside the workspace is refused. */
+function loadConfig(root, explicit = '') {
+    const file = path.resolve(root, explicit || exports.CONFIG_FILE);
+    if (!fs.existsSync(file)) {
+        return explicit ? { ...exports.EMPTY_CONFIG, warnings: [`config ${explicit} not found; scanning with defaults`] } : exports.EMPTY_CONFIG;
+    }
+    const source = path.relative(root, file) || exports.CONFIG_FILE;
+    let real;
+    try {
+        const realRoot = fs.realpathSync(root);
+        real = fs.realpathSync(file);
+        const inside = path.relative(realRoot, real);
+        if (!inside || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+            return { ...exports.EMPTY_CONFIG, warnings: [`${source}: resolves outside the workspace; scanning with defaults`] };
+        }
+    }
+    catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return { ...exports.EMPTY_CONFIG, warnings: [`${source}: cannot be resolved (${message}); scanning with defaults`] };
+    }
+    try {
+        return parseConfig(JSON.parse(fs.readFileSync(real, 'utf-8')), source);
+    }
+    catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return { ...exports.EMPTY_CONFIG, warnings: [`${source}: not valid JSON (${message}); scanning with defaults`] };
+    }
+}
+function isExcluded(relativePath, config) {
+    const rel = relativePath.split(path.sep).join('/');
+    return config.excludeRes.some((re) => re.test(rel));
+}
+function extraPatternCount(config) {
+    return Object.values(config.patterns).reduce((n, list) => n + (list ? list.length : 0), 0);
+}
 const AGENT_FRAMEWORK_PATTERNS = [
     /^\s*(?:import\s+(?:langchain|crewai|openai|anthropic|autogen|google\.generativeai|smolagents|llama_index|haystack|semantic_kernel|dspy|pydantic_ai))/m,
     /^\s*(?:from\s+(?:langchain|crewai|openai|anthropic|autogen|google\.generativeai|smolagents|llama_index|haystack|semantic_kernel|dspy|pydantic_ai)[\s.])/m,
@@ -32401,7 +32885,7 @@ const HUMAN_OVERSIGHT_PATTERNS = [
 const ERROR_HANDLING_PATTERN = /try\s*:/;
 const EXCEPT_PATTERN = /except\s*(?:\w|[:(])/;
 // Skips build/venv dirs, symlinks, and files over 1 MiB.
-function scanDirectory(dirPath) {
+function scanDirectory(dirPath, config = exports.EMPTY_CONFIG, root = dirPath) {
     const results = [];
     function walk(currentPath) {
         let entries;
@@ -32415,6 +32899,8 @@ function scanDirectory(dirPath) {
             if (entry.isSymbolicLink())
                 continue;
             const fullPath = path.join(currentPath, entry.name);
+            if (isExcluded(path.relative(root, fullPath), config))
+                continue;
             if (entry.isDirectory()) {
                 const skip = [
                     'node_modules', '.git', '__pycache__', '.venv', 'venv',
@@ -32459,7 +32945,8 @@ function checkPatterns(patterns, content) {
             .filter((v) => v !== null),
     };
 }
-function analyzeFile(filePath, content) {
+function analyzeFile(filePath, content, config = exports.EMPTY_CONFIG) {
+    const withRepo = (key, builtin) => [...builtin, ...(config.patterns[key] || [])];
     const detectedFrameworks = [];
     for (const pat of AGENT_FRAMEWORK_PATTERNS) {
         const match = content.match(pat);
@@ -32471,15 +32958,16 @@ function analyzeFile(filePath, content) {
             }
         }
     }
-    const auditTrail = checkPatterns(AUDIT_TRAIL_PATTERNS, content);
-    const policyEnforcement = checkPatterns(POLICY_PATTERNS, content);
-    const revocation = checkPatterns(REVOCATION_PATTERNS, content);
-    const humanOversight = checkPatterns(HUMAN_OVERSIGHT_PATTERNS, content);
+    const auditTrail = checkPatterns(withRepo('auditTrail', AUDIT_TRAIL_PATTERNS), content);
+    const policyEnforcement = checkPatterns(withRepo('policyEnforcement', POLICY_PATTERNS), content);
+    const revocation = checkPatterns(withRepo('revocation', REVOCATION_PATTERNS), content);
+    const humanOversight = checkPatterns(withRepo('humanOversight', HUMAN_OVERSIGHT_PATTERNS), content);
     const hasTry = ERROR_HANDLING_PATTERN.test(content);
     const hasExcept = EXCEPT_PATTERN.test(content);
+    const repoErrors = checkPatterns(config.patterns.errorHandling || [], content);
     const errorHandling = {
-        pass: hasTry && hasExcept,
-        matches: hasTry && hasExcept ? ['try/except'] : [],
+        pass: (hasTry && hasExcept) || repoErrors.pass,
+        matches: [...(hasTry && hasExcept ? ['try/except'] : []), ...repoErrors.matches],
     };
     return {
         filePath,
@@ -32509,11 +32997,28 @@ function computeScore(results) {
     }
     return Math.round(score);
 }
-function generateReport(results) {
+function configNote(config) {
+    if (!config.source)
+        return [];
+    const parts = [];
+    const n = extraPatternCount(config);
+    if (n) {
+        const per = Object.entries(config.patterns)
+            .map(([k, v]) => `${GOVERNANCE_CATEGORIES.find((c) => c.key === k)?.label ?? k} +${v.length}`).join(', ');
+        parts.push(`${n} extra pattern(s) (${per})`);
+    }
+    if (config.exclude.length)
+        parts.push(`${config.exclude.length} excluded path(s): ${config.exclude.map((e) => `\`${e}\``).join(', ')}`);
+    return parts.length
+        ? [`> Repository config \`${config.source}\`: ${parts.join('; ')}. Built-in patterns still apply.`, '']
+        : [];
+}
+function generateReport(results, config = exports.EMPTY_CONFIG) {
     if (results.length === 0) {
         return [
             '## :shield: AI Agent Governance Report',
             '',
+            ...configNote(config),
             '**No AI agent framework usage detected.** No Python files importing known agent frameworks (LangChain, CrewAI, OpenAI, Anthropic, AutoGen, etc.) were found in the scanned path.',
             '',
             '---',
@@ -32553,6 +33058,7 @@ function generateReport(results) {
     const lines = [];
     lines.push(`## :shield: AI Agent Governance Report`);
     lines.push('');
+    lines.push(...configNote(config));
     lines.push(`| Metric | Value |`);
     lines.push(`|--------|-------|`);
     lines.push(`| **Compliance Score** | ${badge} **${score}/100** |`);

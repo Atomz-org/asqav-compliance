@@ -1,7 +1,7 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as path from 'path';
-import { scanDirectory, analyzeFile, generateReport, computeScore, AnalysisResult } from './scanner';
+import { scanDirectory, analyzeFile, generateReport, computeScore, loadConfig, extraPatternCount, AnalysisResult } from './scanner';
 
 async function run(): Promise<void> {
   try {
@@ -13,6 +13,15 @@ async function run(): Promise<void> {
     const fullScanPath: string = path.resolve(workspace, scanPath);
 
     core.info(`Scanning for AI agent governance gaps in: ${fullScanPath}`);
+
+    // The repository's own vocabulary (`.asqav.json` or the `config` input):
+    // extra patterns per category and excluded paths. Additive only; a missing
+    // or broken config scans with the defaults and says why.
+    const config = loadConfig(workspace, core.getInput('config') || '');
+    for (const w of config.warnings) core.warning(w);
+    if (config.source) {
+      core.info(`Repository config ${config.source}: ${extraPatternCount(config)} extra pattern(s), ${config.exclude.length} exclusion(s)`);
+    }
 
     // Anonymous health ping; never blocks the action even if the network is down.
     try {
@@ -28,15 +37,15 @@ async function run(): Promise<void> {
       req.end();
     } catch (e) {}
 
-    const agentFiles = scanDirectory(fullScanPath);
+    const agentFiles = scanDirectory(fullScanPath, config, workspace);
     core.info(`Found ${agentFiles.length} Python file(s) using AI agent frameworks`);
 
     const results: AnalysisResult[] = agentFiles.map(({ filePath, content }) => {
       const relativePath: string = path.relative(workspace, filePath);
-      return analyzeFile(relativePath, content);
+      return analyzeFile(relativePath, content, config);
     });
 
-    const report: string = generateReport(results);
+    const report: string = generateReport(results, config);
     core.info('Compliance report generated');
 
     const context = github.context;

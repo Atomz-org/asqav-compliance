@@ -23,6 +23,219 @@ export interface AnalysisResult {
   errorHandling: GovCheck;
 }
 
+export type CategoryKey = 'auditTrail' | 'policyEnforcement' | 'revocation' | 'humanOversight' | 'errorHandling';
+
+const CATEGORY_KEYS: CategoryKey[] = ['auditTrail', 'policyEnforcement', 'revocation', 'humanOversight', 'errorHandling'];
+
+/**
+ * A repository's own vocabulary, read from `.asqav.json` at the scan root (or
+ * the `config` input). It can only *add*: extra patterns per category, and
+ * paths to leave out (tests, fixtures, examples). The built-in patterns always
+ * apply, so a config cannot switch a check off — it can only teach the scanner
+ * how this codebase spells a control it already has.
+ */
+export interface ScanConfig {
+  source: string | null;
+  exclude: string[];
+  excludeRes: RegExp[];
+  patterns: Partial<Record<CategoryKey, RegExp[]>>;
+  warnings: string[];
+}
+
+export const EMPTY_CONFIG: ScanConfig = { source: null, exclude: [], excludeRes: [], patterns: {}, warnings: [] };
+
+export const CONFIG_FILE = '.asqav.json';
+
+/** A path glob as a regex over `/`-separated relative paths: `**` crosses directories, `*` and `?` do not. */
+export function globToRegExp(glob: string): RegExp {
+  let out: string = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c: string = glob[i];
+    if (c === '*' && glob[i + 1] === '*') {
+      i++;
+      if (glob[i + 1] === '/') {
+        i++;
+        out += '(?:.*/)?';
+      } else {
+        out += '.*';
+      }
+    } else if (c === '*') {
+      out += '[^/]*';
+    } else if (c === '?') {
+      out += '[^/]';
+    } else {
+      out += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/** Longest repository pattern accepted; longer ones are refused, not truncated. */
+export const MAX_PATTERN_LENGTH = 200;
+
+/**
+ * Why a repository pattern could make matching unbounded, or null when it is
+ * safe to run. JavaScript regexes have no timeout, and a config pattern runs
+ * synchronously over every scanned file (up to 1 MiB), so a shape that
+ * backtracks catastrophically would stall the scan. Refused before compiling:
+ * backreferences, and a repeated group (`*`, `+`, `{n,}`, `{n,m}` with m > 1)
+ * that itself contains a repeat — `(a+)+`, `(\\w*)*` — or an alternation —
+ * `(a|aa)+`. Deliberately conservative: a refused pattern is a warning and the
+ * built-in patterns still apply.
+ */
+export function unsafePattern(pattern: string): string | null {
+  if (pattern.length > MAX_PATTERN_LENGTH) return `longer than ${MAX_PATTERN_LENGTH} characters`;
+  if (/\\[1-9]|\\k</.test(pattern)) return 'uses a backreference';
+  interface Frame { repeats: boolean; alternates: boolean }
+  const stack: Frame[] = [{ repeats: false, alternates: false }];
+  // A quantifier at i that repeats (more than once); returns its length, or 0.
+  const repeatAt = (i: number): number => {
+    const c: string = pattern[i];
+    if (c === '*' || c === '+') return 1;
+    if (c === '{') {
+      const m: RegExpMatchArray | null = pattern.slice(i).match(/^\{(\d+)(,(\d*))?\}/);
+      if (m && (m[2] !== undefined && (m[3] === '' || Number(m[3]) > 1))) return m[0].length;
+      if (m && Number(m[1]) > 1 && m[2] === undefined) return m[0].length;
+    }
+    return 0;
+  };
+  for (let i = 0; i < pattern.length; i++) {
+    const c: string = pattern[i];
+    const top: Frame = stack[stack.length - 1];
+    if (c === '\\') {
+      i++;
+      if (repeatAt(i + 1)) top.repeats = true;
+      continue;
+    }
+    if (c === '[') {
+      let j: number = i + 1;
+      while (j < pattern.length && pattern[j] !== ']') j += pattern[j] === '\\' ? 2 : 1;
+      i = j;
+      if (repeatAt(i + 1)) top.repeats = true;
+      continue;
+    }
+    if (c === '(') {
+      stack.push({ repeats: false, alternates: false });
+      continue;
+    }
+    if (c === '|') {
+      top.alternates = true;
+      continue;
+    }
+    if (c === ')') {
+      const inner: Frame = stack.length > 1 ? (stack.pop() as Frame) : top;
+      const parent: Frame = stack[stack.length - 1];
+      if (repeatAt(i + 1)) {
+        if (inner.repeats) return 'repeats a group that already repeats (nested quantifier)';
+        if (inner.alternates) return 'repeats a group with alternatives';
+        parent.repeats = true;
+      }
+      parent.repeats = parent.repeats || inner.repeats;
+      continue;
+    }
+    if (repeatAt(i + 1) && c !== '?' && c !== '*' && c !== '+' && c !== '}') top.repeats = true;
+  }
+  return null;
+}
+
+/** Parse a config object; problems become warnings and the scan falls back to defaults. */
+export function parseConfig(raw: unknown, source: string): ScanConfig {
+  const config: ScanConfig = { source, exclude: [], excludeRes: [], patterns: {}, warnings: [] };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    config.warnings.push(`${source}: expected a JSON object; ignored`);
+    return { ...EMPTY_CONFIG, warnings: config.warnings };
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.version !== undefined && obj.version !== 1) {
+    config.warnings.push(`${source}: unsupported version ${String(obj.version)}; ignored`);
+    return { ...EMPTY_CONFIG, warnings: config.warnings };
+  }
+  if (obj.exclude !== undefined) {
+    if (!Array.isArray(obj.exclude)) {
+      config.warnings.push(`${source}: "exclude" must be a list of globs; ignored`);
+    } else {
+      for (const g of obj.exclude) {
+        if (typeof g === 'string' && g.trim()) {
+          config.exclude.push(g.trim());
+          config.excludeRes.push(globToRegExp(g.trim().replace(/^\.\//, '')));
+        } else {
+          config.warnings.push(`${source}: exclude entry ${JSON.stringify(g)} is not a glob; skipped`);
+        }
+      }
+    }
+  }
+  const patterns = obj.patterns;
+  if (patterns !== undefined) {
+    if (typeof patterns !== 'object' || patterns === null || Array.isArray(patterns)) {
+      config.warnings.push(`${source}: "patterns" must map a category to a list of regexes; ignored`);
+    } else {
+      for (const [key, list] of Object.entries(patterns as Record<string, unknown>)) {
+        if (!CATEGORY_KEYS.includes(key as CategoryKey)) {
+          config.warnings.push(`${source}: unknown category "${key}" (expected one of ${CATEGORY_KEYS.join(', ')}); skipped`);
+          continue;
+        }
+        if (!Array.isArray(list)) {
+          config.warnings.push(`${source}: patterns.${key} must be a list; skipped`);
+          continue;
+        }
+        const compiled: RegExp[] = [];
+        for (const p of list) {
+          try {
+            if (typeof p !== 'string' || !p) throw new Error('not a string');
+            const unsafe: string | null = unsafePattern(p);
+            if (unsafe) {
+              config.warnings.push(`${source}: patterns.${key} entry ${JSON.stringify(p)} ${unsafe}, which can stall a scan; skipped`);
+              continue;
+            }
+            compiled.push(new RegExp(p));
+          } catch (e) {
+            config.warnings.push(`${source}: patterns.${key} entry ${JSON.stringify(p)} is not a valid regex; skipped`);
+          }
+        }
+        if (compiled.length) config.patterns[key as CategoryKey] = compiled;
+      }
+    }
+  }
+  return config;
+}
+
+/** The repository config at `explicit` (relative to root) or `<root>/.asqav.json`; none is not an error.
+ *  Both paths are resolved through symlinks, and a config that lands outside the workspace is refused. */
+export function loadConfig(root: string, explicit: string = ''): ScanConfig {
+  const file: string = path.resolve(root, explicit || CONFIG_FILE);
+  if (!fs.existsSync(file)) {
+    return explicit ? { ...EMPTY_CONFIG, warnings: [`config ${explicit} not found; scanning with defaults`] } : EMPTY_CONFIG;
+  }
+  const source: string = path.relative(root, file) || CONFIG_FILE;
+  let real: string;
+  try {
+    const realRoot: string = fs.realpathSync(root);
+    real = fs.realpathSync(file);
+    const inside: string = path.relative(realRoot, real);
+    if (!inside || inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+      return { ...EMPTY_CONFIG, warnings: [`${source}: resolves outside the workspace; scanning with defaults`] };
+    }
+  } catch (e) {
+    const message: string = e instanceof Error ? e.message : String(e);
+    return { ...EMPTY_CONFIG, warnings: [`${source}: cannot be resolved (${message}); scanning with defaults`] };
+  }
+  try {
+    return parseConfig(JSON.parse(fs.readFileSync(real, 'utf-8')), source);
+  } catch (e) {
+    const message: string = e instanceof Error ? e.message : String(e);
+    return { ...EMPTY_CONFIG, warnings: [`${source}: not valid JSON (${message}); scanning with defaults`] };
+  }
+}
+
+export function isExcluded(relativePath: string, config: ScanConfig): boolean {
+  const rel: string = relativePath.split(path.sep).join('/');
+  return config.excludeRes.some((re: RegExp) => re.test(rel));
+}
+
+export function extraPatternCount(config: ScanConfig): number {
+  return Object.values(config.patterns).reduce((n: number, list?: RegExp[]) => n + (list ? list.length : 0), 0);
+}
+
 const AGENT_FRAMEWORK_PATTERNS: RegExp[] = [
   /^\s*(?:import\s+(?:langchain|crewai|openai|anthropic|autogen|google\.generativeai|smolagents|llama_index|haystack|semantic_kernel|dspy|pydantic_ai))/m,
   /^\s*(?:from\s+(?:langchain|crewai|openai|anthropic|autogen|google\.generativeai|smolagents|llama_index|haystack|semantic_kernel|dspy|pydantic_ai)[\s.])/m,
@@ -89,7 +302,7 @@ const ERROR_HANDLING_PATTERN: RegExp = /try\s*:/;
 const EXCEPT_PATTERN: RegExp = /except\s*(?:\w|[:(])/;
 
 // Skips build/venv dirs, symlinks, and files over 1 MiB.
-export function scanDirectory(dirPath: string): FileResult[] {
+export function scanDirectory(dirPath: string, config: ScanConfig = EMPTY_CONFIG, root: string = dirPath): FileResult[] {
   const results: FileResult[] = [];
 
   function walk(currentPath: string): void {
@@ -103,6 +316,8 @@ export function scanDirectory(dirPath: string): FileResult[] {
     for (const entry of entries) {
       if (entry.isSymbolicLink()) continue;
       const fullPath: string = path.join(currentPath, entry.name);
+
+      if (isExcluded(path.relative(root, fullPath), config)) continue;
 
       if (entry.isDirectory()) {
         const skip: string[] = [
@@ -152,7 +367,8 @@ function checkPatterns(patterns: RegExp[], content: string): GovCheck {
   };
 }
 
-export function analyzeFile(filePath: string, content: string): AnalysisResult {
+export function analyzeFile(filePath: string, content: string, config: ScanConfig = EMPTY_CONFIG): AnalysisResult {
+  const withRepo = (key: CategoryKey, builtin: RegExp[]): RegExp[] => [...builtin, ...(config.patterns[key] || [])];
   const detectedFrameworks: string[] = [];
   for (const pat of AGENT_FRAMEWORK_PATTERNS) {
     const match: RegExpMatchArray | null = content.match(pat);
@@ -165,16 +381,17 @@ export function analyzeFile(filePath: string, content: string): AnalysisResult {
     }
   }
 
-  const auditTrail: GovCheck = checkPatterns(AUDIT_TRAIL_PATTERNS, content);
-  const policyEnforcement: GovCheck = checkPatterns(POLICY_PATTERNS, content);
-  const revocation: GovCheck = checkPatterns(REVOCATION_PATTERNS, content);
-  const humanOversight: GovCheck = checkPatterns(HUMAN_OVERSIGHT_PATTERNS, content);
+  const auditTrail: GovCheck = checkPatterns(withRepo('auditTrail', AUDIT_TRAIL_PATTERNS), content);
+  const policyEnforcement: GovCheck = checkPatterns(withRepo('policyEnforcement', POLICY_PATTERNS), content);
+  const revocation: GovCheck = checkPatterns(withRepo('revocation', REVOCATION_PATTERNS), content);
+  const humanOversight: GovCheck = checkPatterns(withRepo('humanOversight', HUMAN_OVERSIGHT_PATTERNS), content);
 
   const hasTry: boolean = ERROR_HANDLING_PATTERN.test(content);
   const hasExcept: boolean = EXCEPT_PATTERN.test(content);
+  const repoErrors: GovCheck = checkPatterns(config.patterns.errorHandling || [], content);
   const errorHandling: GovCheck = {
-    pass: hasTry && hasExcept,
-    matches: hasTry && hasExcept ? ['try/except'] : [],
+    pass: (hasTry && hasExcept) || repoErrors.pass,
+    matches: [...(hasTry && hasExcept ? ['try/except'] : []), ...repoErrors.matches],
   };
 
   return {
@@ -187,8 +404,6 @@ export function analyzeFile(filePath: string, content: string): AnalysisResult {
     errorHandling,
   };
 }
-
-type CategoryKey = 'auditTrail' | 'policyEnforcement' | 'revocation' | 'humanOversight' | 'errorHandling';
 
 interface CategoryDef {
   key: CategoryKey;
@@ -221,11 +436,27 @@ export function computeScore(results: AnalysisResult[]): number {
   return Math.round(score);
 }
 
-export function generateReport(results: AnalysisResult[]): string {
+function configNote(config: ScanConfig): string[] {
+  if (!config.source) return [];
+  const parts: string[] = [];
+  const n: number = extraPatternCount(config);
+  if (n) {
+    const per: string = (Object.entries(config.patterns) as [CategoryKey, RegExp[]][])
+      .map(([k, v]) => `${GOVERNANCE_CATEGORIES.find((c) => c.key === k)?.label ?? k} +${v.length}`).join(', ');
+    parts.push(`${n} extra pattern(s) (${per})`);
+  }
+  if (config.exclude.length) parts.push(`${config.exclude.length} excluded path(s): ${config.exclude.map((e) => `\`${e}\``).join(', ')}`);
+  return parts.length
+    ? [`> Repository config \`${config.source}\`: ${parts.join('; ')}. Built-in patterns still apply.`, '']
+    : [];
+}
+
+export function generateReport(results: AnalysisResult[], config: ScanConfig = EMPTY_CONFIG): string {
   if (results.length === 0) {
     return [
       '## :shield: AI Agent Governance Report',
       '',
+      ...configNote(config),
       '**No AI agent framework usage detected.** No Python files importing known agent frameworks (LangChain, CrewAI, OpenAI, Anthropic, AutoGen, etc.) were found in the scanned path.',
       '',
       '---',
@@ -268,6 +499,7 @@ export function generateReport(results: AnalysisResult[]): string {
   const lines: string[] = [];
   lines.push(`## :shield: AI Agent Governance Report`);
   lines.push('');
+  lines.push(...configNote(config));
   lines.push(`| Metric | Value |`);
   lines.push(`|--------|-------|`);
   lines.push(`| **Compliance Score** | ${badge} **${score}/100** |`);
