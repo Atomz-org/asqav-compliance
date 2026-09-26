@@ -32604,8 +32604,9 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.CONFIG_FILE = exports.EMPTY_CONFIG = void 0;
+exports.MAX_PATTERN_LENGTH = exports.CONFIG_FILE = exports.EMPTY_CONFIG = void 0;
 exports.globToRegExp = globToRegExp;
+exports.unsafePattern = unsafePattern;
 exports.parseConfig = parseConfig;
 exports.loadConfig = loadConfig;
 exports.isExcluded = isExcluded;
@@ -32645,6 +32646,82 @@ function globToRegExp(glob) {
         }
     }
     return new RegExp(`^${out}$`);
+}
+/** Longest repository pattern accepted; longer ones are refused, not truncated. */
+exports.MAX_PATTERN_LENGTH = 200;
+/**
+ * Why a repository pattern could make matching unbounded, or null when it is
+ * safe to run. JavaScript regexes have no timeout, and a config pattern runs
+ * synchronously over every scanned file (up to 1 MiB), so a shape that
+ * backtracks catastrophically would stall the scan. Refused before compiling:
+ * backreferences, and a repeated group (`*`, `+`, `{n,}`, `{n,m}` with m > 1)
+ * that itself contains a repeat — `(a+)+`, `(\\w*)*` — or an alternation —
+ * `(a|aa)+`. Deliberately conservative: a refused pattern is a warning and the
+ * built-in patterns still apply.
+ */
+function unsafePattern(pattern) {
+    if (pattern.length > exports.MAX_PATTERN_LENGTH)
+        return `longer than ${exports.MAX_PATTERN_LENGTH} characters`;
+    if (/\\[1-9]|\\k</.test(pattern))
+        return 'uses a backreference';
+    const stack = [{ repeats: false, alternates: false }];
+    // A quantifier at i that repeats (more than once); returns its length, or 0.
+    const repeatAt = (i) => {
+        const c = pattern[i];
+        if (c === '*' || c === '+')
+            return 1;
+        if (c === '{') {
+            const m = pattern.slice(i).match(/^\{(\d+)(,(\d*))?\}/);
+            if (m && (m[2] !== undefined && (m[3] === '' || Number(m[3]) > 1)))
+                return m[0].length;
+            if (m && Number(m[1]) > 1 && m[2] === undefined)
+                return m[0].length;
+        }
+        return 0;
+    };
+    for (let i = 0; i < pattern.length; i++) {
+        const c = pattern[i];
+        const top = stack[stack.length - 1];
+        if (c === '\\') {
+            i++;
+            if (repeatAt(i + 1))
+                top.repeats = true;
+            continue;
+        }
+        if (c === '[') {
+            let j = i + 1;
+            while (j < pattern.length && pattern[j] !== ']')
+                j += pattern[j] === '\\' ? 2 : 1;
+            i = j;
+            if (repeatAt(i + 1))
+                top.repeats = true;
+            continue;
+        }
+        if (c === '(') {
+            stack.push({ repeats: false, alternates: false });
+            continue;
+        }
+        if (c === '|') {
+            top.alternates = true;
+            continue;
+        }
+        if (c === ')') {
+            const inner = stack.length > 1 ? stack.pop() : top;
+            const parent = stack[stack.length - 1];
+            if (repeatAt(i + 1)) {
+                if (inner.repeats)
+                    return 'repeats a group that already repeats (nested quantifier)';
+                if (inner.alternates)
+                    return 'repeats a group with alternatives';
+                parent.repeats = true;
+            }
+            parent.repeats = parent.repeats || inner.repeats;
+            continue;
+        }
+        if (repeatAt(i + 1) && c !== '?' && c !== '*' && c !== '+' && c !== '}')
+            top.repeats = true;
+    }
+    return null;
 }
 /** Parse a config object; problems become warnings and the scan falls back to defaults. */
 function parseConfig(raw, source) {
@@ -32694,6 +32771,11 @@ function parseConfig(raw, source) {
                     try {
                         if (typeof p !== 'string' || !p)
                             throw new Error('not a string');
+                        const unsafe = unsafePattern(p);
+                        if (unsafe) {
+                            config.warnings.push(`${source}: patterns.${key} entry ${JSON.stringify(p)} ${unsafe}, which can stall a scan; skipped`);
+                            continue;
+                        }
                         compiled.push(new RegExp(p));
                     }
                     catch (e) {

@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { analyzeFile, generateReport, globToRegExp, loadConfig, parseConfig, scanDirectory, EMPTY_CONFIG } from './scanner';
+import { analyzeFile, generateReport, globToRegExp, loadConfig, parseConfig, scanDirectory, unsafePattern, EMPTY_CONFIG, MAX_PATTERN_LENGTH } from './scanner';
 
 let passed: number = 0;
 let failed: number = 0;
@@ -340,6 +340,26 @@ test('the report says when a repository config extended the vocabulary', () => {
   assert.ok(report.includes('Audit Trail +1') && report.includes('`**/tests/**`'), 'what it added');
   assert.ok(report.includes('Built-in patterns still apply'));
   assert.ok(!generateReport([analyzeFile('agent.py', TRACED)]).includes('Repository config'), 'silent without one');
+});
+
+test('patterns that can backtrack catastrophically are refused before they run', () => {
+  for (const bad of ['(a+)+$', '(\\w*)*x', '(?:a|aa)+b', '(x{2,})+', '(a{1,5})*', '((ab)*c)+', '(\\s+)*$', '(.)\\1+', '(?<q>a)\\k<q>']) {
+    assert.ok(unsafePattern(bad), `should refuse ${bad}`);
+  }
+  assert.ok(unsafePattern('a'.repeat(MAX_PATTERN_LENGTH + 1)), 'overlong');
+  for (const ok of ['\\btrace\\.(get|start|decision)\\(', '\\btr\\.(intent|request)\\(', '(?:ab)+c', 'a+b*c?', '(get|start)?\\(',
+                    '[a-z]+\\d{2,4}', 'x{2}(y)+', '[(+*]+', '\\(+']) {
+    assert.strictEqual(unsafePattern(ok), null, `should accept ${ok}`);
+  }
+});
+
+test('a refused pattern is a warning; the rest of the config and the built-ins still apply', () => {
+  const config = parseConfig({ patterns: { auditTrail: ['(a+)+$', 'trace\\.get\\('] } }, '.asqav.json');
+  assert.strictEqual(config.patterns.auditTrail?.length, 1);
+  assert.ok(config.warnings.some((w) => w.includes('(a+)+$') && w.includes('stall')));
+  const started: number = Date.now();
+  analyzeFile('x.py', `import openai\n${'a'.repeat(50000)}!\n`, config);
+  assert.ok(Date.now() - started < 1000, 'no pathological pattern reached the file');
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
